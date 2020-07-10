@@ -159,15 +159,14 @@ doParallel::stopImplicitCluster()
 rf_spec <- 
   rand_forest(
     mtry = tune(),
-    trees = 50,
-    min_n = tune()) %>%
+    trees = 20,
+    min_n = 500) %>%
   set_mode("classification") %>%
-  set_engine("ranger")
+  set_engine("randomForest")
 
 rf_grid <- grid_latin_hypercube(
-  min_n(),
-  finalize(mtry(), bank_train),
-  size = 10)
+  finalize(mtry(), bank_train_up),
+  size = 4)
 
 rf_wf <- workflow() %>%
   add_formula(y ~ .) %>%
@@ -186,8 +185,8 @@ rf_res <- tune_grid(
 rf_res %>%
   collect_metrics() %>%
   filter(.metric == "accuracy") %>%
-  select(mean, mtry:sample_size) %>%
-  pivot_longer(mtry:sample_size,
+  select(mean, mtry) %>%
+  pivot_longer(mtry,
                values_to = "value",
                names_to = "parameter") %>%
   ggplot(aes(value, mean, color = parameter)) +
@@ -200,13 +199,8 @@ final_rf <- finalize_workflow(
   rf_wf,
   rf_best_acc)
 
-final_rf %>%
-  fit(data = bank_train) %>%
-  pull_workflow_fit() %>%
-  vip(geom = "point", num_features = 20)
-
-final_rf <- last_fit(final_rf, data_split)
-collect_metrics(final_rf)
+final_res_rf <- last_fit(final_rf, data_split)
+collect_metrics(final_res_rf)
 
 # - fit final model
 model_rf <- final_rf %>% fit(data = bank_train_up)
