@@ -1,0 +1,246 @@
+---
+title: "Bank & Marketing"
+author: "Ing. Peter Tomko, M.A."
+date: "9/7/2020"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidymodels)
+library(dplyr)
+library(data.table)
+library(tidyr)
+library(readr)
+library(fastDummies)
+library(vip)
+
+# - variables are transformed using one hot encoder, i.e. dummy preparation
+# - target is transformed into factor
+bank_full <- 
+  read_delim("data/bank-additional-full.csv", ";", 
+             escape_double = FALSE, trim_ws = TRUE) %>%
+  as.data.frame() %>%
+  
+  dummy_cols(.data = ., 
+             select_columns = c("job", "marital", "education", "default", 
+                                "housing", "loan", "contact", "month", 
+                                "day_of_week", "poutcome"), 
+             remove_selected_columns = T) %>%
+  mutate_if(is.character, as.factor) %>%
+  as.data.frame()
+
+names(bank_full) <- 
+  stringr::str_replace_all(stringr::str_replace_all(string = names(bank_full), 
+                                                    pattern = "\\.", 
+                                                    replacement = "-"), 
+                           "-", "__")
+```
+
+## Common Objects
+```{r}
+# - up sampling performed in order to reduce over fitting
+# - in xgboost, the tree depth regulated for over fitting
+# - random forest, by definition it is build using uncorrelated trees in order to reduce overfitting 
+set.seed(123)
+data_split <- initial_split(bank_full, strata = y)
+bank_train <- training(data_split)
+bank_test <- testing(data_split)
+
+# - up sampling of the data
+bank_train_up <- 
+  recipe(~., bank_train) %>%
+  step_upsample(y, over_ratio = 1) %>%
+  prep() %>%
+  juice()
+
+set.seed(123)
+data_folds <- vfold_cv(bank_train_up, strata = y, v = 20)
+```
+
+## Tidymodelling using XGboost
+```{r xgboost model}
+xgb_spec <- 
+  boost_tree(
+    trees = 30, 
+    tree_depth = 4, 
+    min_n = tune(), 
+    loss_reduction = tune(),
+    mtry = tune(),
+    learn_rate = tune()) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+xgb_grid <- grid_latin_hypercube(
+  min_n(),
+  loss_reduction(),
+  finalize(mtry(), bank_train_up),
+  learn_rate(),
+  size = 20)
+
+xgb_wf <- workflow() %>%
+  add_formula(y ~ .) %>%
+  add_model(xgb_spec)
+
+doParallel::registerDoParallel(cores = 4)
+set.seed(234)
+xgb_res <- tune_grid(
+  xgb_wf,
+  resamples = data_folds,
+  grid = xgb_grid,
+  metrics = yardstick::metric_set(pr_auc, accuracy),
+  control = control_grid(save_pred = TRUE))
+
+xgb_res %>%
+  collect_metrics() %>%
+  filter(.metric == "accuracy") %>%
+  select(mean, mtry:loss_reduction) %>%
+  pivot_longer(mtry:loss_reduction,
+               values_to = "value",
+               names_to = "parameter") %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "Accuracy")
+
+best_acc <- select_best(xgb_res, "accuracy")
+final_xgb <- finalize_workflow(xgb_wf, best_acc)
+
+final_xgb %>%
+  fit(data = bank_train_up) %>%
+  pull_workflow_fit() %>%
+  vip(geom = "point", num_features = 20)
+
+final_res <- last_fit(final_xgb, data_split)
+collect_metrics(final_res)
+
+# - fit final model
+model_fit <- final_xgb %>% fit(data = bank_train_up)
+predict(model_fit, bank_train_up, type = "prob") %>%
+  mutate(sample = "train",
+         y = bank_train_up$y) %>%
+  rbind(., predict(model_fit, bank_test, type = "prob") %>%
+          mutate(sample = "test",
+                 y = bank_test$y)) %>%
+  group_by(sample) %>%
+  roc_curve(y, `.pred_yes`) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, col = sample)) +
+  geom_line(size = 1.0, color = "midnightblue") +
+  geom_abline(lty = 2, alpha = 0.5, color = "gray50", size = 1.2) +
+  ggtitle("Comparison of Training & Testing Performance")
+
+# - print confusion matrices
+mat_train = predict(model_fit, bank_train_up) %>% cbind(., bank_train_up$y)
+names(mat_train) <- c("pred", "true")
+conf_mat(mat_train, truth = true, estimate = pred)
+
+mat_test = predict(model_fit, bank_test) %>% cbind(., bank_test$y)
+names(mat_test) <- c("pred", "true")
+conf_mat(mat_test, truth = true, estimate = pred)
+
+# - print AUC for test/train
+predict(model_fit, bank_train_up, type = "prob") %>%
+  mutate(sample = "train",
+         y = bank_train_up$y) %>%
+  rbind(., predict(model_fit, bank_test, type = "prob") %>%
+          mutate(sample = "test",
+                 y = bank_test$y)) %>%
+  group_by(sample) %>%
+  roc_auc(y, `.pred_yes`)
+
+doParallel::stopImplicitCluster()
+```
+
+## Tidymodelling using Random Forest
+```{r Random Forest model}
+rf_spec <- 
+  rand_forest(
+    mtry = tune(),
+    trees = 50,
+    min_n = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("ranger")
+
+rf_grid <- grid_latin_hypercube(
+  min_n(),
+  finalize(mtry(), bank_train),
+  size = 10)
+
+rf_wf <- workflow() %>%
+  add_formula(y ~ .) %>%
+  add_model(rf_spec)
+
+set.seed(234)
+doParallel::registerDoParallel(cores = 4)
+
+rf_res <- tune_grid(
+  rf_wf,
+  resamples = data_folds,
+  grid = rf_grid,
+  metrics = yardstick::metric_set(pr_auc, accuracy),
+  control = control_grid(save_pred = TRUE))
+
+rf_res %>%
+  collect_metrics() %>%
+  filter(.metric == "accuracy") %>%
+  select(mean, mtry:sample_size) %>%
+  pivot_longer(mtry:sample_size,
+               values_to = "value",
+               names_to = "parameter") %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "Accuracy")
+
+rf_best_acc <- select_best(rf_res, "accuracy")
+final_rf <- finalize_workflow(
+  rf_wf,
+  rf_best_acc)
+
+final_rf %>%
+  fit(data = bank_train) %>%
+  pull_workflow_fit() %>%
+  vip(geom = "point", num_features = 20)
+
+final_rf <- last_fit(final_rf, data_split)
+collect_metrics(final_rf)
+
+# - fit final model
+model_rf <- final_rf %>% fit(data = bank_train_up)
+predict(model_rf, bank_train_up, type = "prob") %>%
+  mutate(sample = "train",
+         y = bank_train_up$y) %>%
+  rbind(., predict(model_rf, bank_test, type = "prob") %>%
+          mutate(sample = "test",
+                 y = bank_test$y)) %>%
+  group_by(sample) %>%
+  roc_curve(y, `.pred_yes`) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, col = sample)) +
+  geom_line(size = 1.0, color = "midnightblue") +
+  geom_abline(lty = 2, alpha = 0.5, color = "gray50", size = 1.2) +
+  ggtitle("Comparison of Training & Testing Performance")
+
+# - print confusion matrices
+mat_train = predict(model_rf, bank_train_up) %>% cbind(., bank_train_up$y)
+names(mat_train) <- c("pred", "true")
+conf_mat(mat_train, truth = true, estimate = pred)
+
+mat_test = predict(model_rf, bank_test) %>% cbind(., bank_test$y)
+names(mat_test) <- c("pred", "true")
+conf_mat(mat_test, truth = true, estimate = pred)
+
+# - print AUC for test/train
+predict(model_rf, bank_train_up, type = "prob") %>%
+  mutate(sample = "train",
+         y = bank_train_up$y) %>%
+  rbind(., predict(model_rf, bank_test, type = "prob") %>%
+          mutate(sample = "test",
+                 y = bank_test$y)) %>%
+  group_by(sample) %>%
+  roc_auc(y, `.pred_yes`)
+
+doParallel::stopImplicitCluster()
+```
