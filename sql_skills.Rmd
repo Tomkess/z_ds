@@ -1,0 +1,169 @@
+---
+title: "Q2"
+author: "Ing. Peter Tomko, M.A."
+date: "9 7 2020"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+# Setting the connection
+
+This is arbitrary database created locally in PostgreSQL.
+```{r Setting the Connection}
+library(DBI)
+con <- DBI::dbConnect(odbc::odbc(), "betting_ds")
+```
+
+# Part 1
+```{sql, connection=con}
+drop table if exists employee;
+create table if not exists employee (
+employee_id serial primary key,
+name varchar(50) not null,
+profession varchar(50) not null);
+```
+
+```{sql, connection=con}
+drop table if exists employee_agg;
+create table if not exists employee_agg as (
+select count(employee_id) as n_employee, profession 
+from employee
+where profession like any(array['%IT%', '%SALES%', '%OTHER%'])
+group by profession);
+```
+
+# Part 2
+Imagine following transaction table - user_id, date.
+```{r Fake Data}
+library(readr)
+library(dplyr)
+library(data.table)
+
+activity_table <- read_csv("data/activity_table.csv", 
+    col_types = cols(event_type = col_skip(), 
+        product_id = col_skip(), category_id = col_skip(), 
+        category_code = col_skip(), brand = col_skip(), 
+        price = col_skip(), user_session = col_skip()))
+
+names(activity_table) <- c("date", "user_id")
+activity_table <- 
+  activity_table %>%
+  mutate(date = as.Date(date) + sample.int(60, n(), replace = T)) %>%
+  distinct() %>%
+  as.data.frame()
+```
+
+Create the table.
+```{sql, connection=con}
+drop table if exists activity_table;
+create table if not exists activity_table (
+user_id integer not null,
+date date not null);
+```
+
+Upload the fake data.
+```{r Upload Activity Data}
+dbWriteTable(con, "activity_table", activity_table, 
+             row.names=FALSE, append=TRUE)
+```
+
+Create output table.
+```{sql, connection=con}
+select date, 
+sum(new_users) as new_users, sum(active_users) as active_users, 
+sum(churned_users) as churned_users, sum(reactivated_users) as reactivated_users
+from
+(select *,
+-- categorization of the clients activity
+case when last_30 > 0 and last_30_60 = 0 and more_60 = 0 then 1 else 0 end as new_users,
+case when last_30 > 0 and last_30_60 > 0 and more_60 >= 0 then 1 else 0 end as active_users,
+case when last_30 = 0 and last_30_60 >= 0 and more_60 >= 0 then 1 else 0 end as churned_users,
+case when last_30 > 0 and last_30_60 = 0 and more_60 > 0 then 1 else 0 end as reactivated_users
+from
+(select user_id, date, sum(last_30) as last_30, sum(last_30_60) as last_30_60, sum(more_60) as more_60
+from
+(select orig_date.*, prev_date.prev_date, 
+-- number of activity in the last 30, 30-60 and more than 60 days
+case when orig_date.date - prev_date.prev_date <= 30 then 1 else 0 end as last_30,
+case when orig_date.date - prev_date.prev_date > 30 and orig_date.date - prev_date.prev_date <= 60  then 1 else 0 end as last_30_60,
+case when orig_date.date - prev_date.prev_date >= 60 then 1 else 0 end as more_60
+from
+(select * from activity_table) as orig_date
+left join
+(select date as prev_date, user_id from activity_table) as prev_date
+on orig_date.user_id = prev_date.user_id
+and orig_date.date >= prev_date.prev_date) as master_data
+group by user_id, date) as cat_data) as agg_data
+group by date;
+```
+
+# Part 3
+
+Create fake data.
+```{r Create Fake Data}
+users_table <- data.frame(user_id = c(1,2,3,4,5),
+                          name = c("A", "B", "C", "D", "E"),
+                          gender = c("M", "F", "F", "M", "F"))
+
+transaction_table <- data.frame(index = c(1:8),
+                                user_id = c(1,2,3,3,4,7,4,7),
+                                age = c(23,34,55,43,54,23,65,44),
+                                weight = c(60,75,80,90,66,57,64,80))
+```
+
+Create users table.
+```{sql, connection=con}
+drop table if exists users_table;
+create table if not exists users_table (
+user_id integer not null,
+name varchar(50) not null,
+gender varchar(50) not null);
+```
+
+Create transaction table.
+```{sql, connection=con}
+drop table if exists transaction_table;
+create table if not exists transaction_table (
+index serial primary key,
+user_id integer not null,
+age integer not null,
+weight integer not null);
+```
+
+Upload the fake data.
+```{r Upload Data}
+dbWriteTable(con, "users_table", users_table, 
+             row.names=FALSE, append=TRUE)
+dbWriteTable(con, "transaction_table", transaction_table, 
+             row.names=FALSE, append=TRUE)
+```
+
+Users not in users_table but in transaction_table
+```{sql, connection=con}
+select distinct tran_data.*, user_data.in_user from
+(select distinct user_id, age, weight from transaction_table) tran_data
+left join 
+(select distinct user_id, name, gender, 1 as in_user from users_table) user_data
+on user_data.user_id = tran_data.user_id
+where in_user is null
+```
+
+Join two tables with one record for duplicates (I will take only the last entry in transaction table per user id - it seems that index aims to capture how the transactions are added into DB and therefore I will restrict only to the most recent entries)
+```{sql, connection=con}
+select tran_data.*, user_data.name, user_data.gender 
+from
+(select index, user_id, age, weight
+from
+(select *, max(index) over(partition by user_id) as last_index
+from transaction_table) as last_data
+where last_index = index) tran_data
+left join 
+(select * from users_table) as user_data
+on tran_data.user_id = user_data.user_id
+```
+
+Unique names per gender category
+```{sql, connection=con}
+select gender, count(distinct name) as n_distinct_names from users_table group by gender
+```
